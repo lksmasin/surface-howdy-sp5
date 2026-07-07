@@ -31,10 +31,16 @@ You also need standard build tools, v4l2loopback, and i2c-tools:
 sudo dnf install gcc v4l2loopback i2c-tools
 ```
 
-### 2. Configure v4l2loopback (Systemd Oneshot)
-Copy the provided systemd service to initialize the loopback device on boot:
+### 2. Configure v4l2loopback and Media Paths (Systemd Oneshot)
+Because the Linux kernel randomly enumerates `/dev/media*` devices on boot, hardcoded media paths will fail after a restart. We provide a dynamic setup script that auto-detects the IPU3 sensor.
+
+Copy the setup script and the systemd service to initialize the hardware on boot:
 ```bash
+sudo cp setup_ipu3.sh /usr/local/bin/setup_ipu3.sh
+sudo chmod +x /usr/local/bin/setup_ipu3.sh
+
 sudo cp surface_ir_bridge.service /etc/systemd/system/
+sudo systemctl daemon-reload
 sudo systemctl enable --now surface_ir_bridge.service
 ```
 
