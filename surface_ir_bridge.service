@@ -1,6 +1,7 @@
 [Unit]
 Description=Surface Pro 5 IR Camera Bridge for Howdy
 After=multi-user.target
+After=suspend.target
 
 [Service]
 Type=oneshot
