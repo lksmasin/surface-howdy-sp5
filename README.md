@@ -23,7 +23,10 @@ We solved this via a stateless, on-demand pipeline:
 ## Installation
 
 ### 1. Prerequisites
-You need standard build tools, v4l2loopback, and i2c-tools:
+**CRITICAL: You MUST be running a kernel that supports the Surface IPU3 ISP and OV7251 sensor.** 
+A standard distribution kernel will not work, as `/dev/video12` will not exist. You must be running the custom [linux-surface](https://github.com/linux-surface/linux-surface) kernel, or a custom patched kernel.
+
+You also need standard build tools, v4l2loopback, and i2c-tools:
 ```bash
 sudo dnf install gcc v4l2loopback i2c-tools
 ```
