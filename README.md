@@ -89,7 +89,7 @@ To enable face unlock on the lock screen and GUI prompts, add `auth sufficient p
 Run `sudo howdy config` and ensure:
 ```ini
 device_path = /dev/video42
-dark_threshold = 60
+dark_threshold = 100
 ```
 
 ## Community
