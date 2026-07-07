@@ -36,8 +36,13 @@ void unpack_and_rotate_ipu3_line(const uint8_t *in, uint8_t *out_frame, int widt
 }
 
 int main(int argc, char **argv) {
-    int fd_in = open("/dev/video12", O_RDWR);
-    if (fd_in < 0) { perror("open /dev/video12"); return 1; }
+    const char *dev_in = "/dev/video12";
+    if (argc > 1) {
+        dev_in = argv[1];
+    }
+    
+    int fd_in = open(dev_in, O_RDWR);
+    if (fd_in < 0) { perror("open input device"); return 1; }
 
     int fd_out = open("/dev/video42", O_RDWR);
     if (fd_out < 0) { perror("open /dev/video42"); return 1; }
