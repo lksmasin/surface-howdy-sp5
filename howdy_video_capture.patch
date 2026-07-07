@@ -1,0 +1,41 @@
+--- /usr/lib/python3.14/site-packages/howdy/recorders/video_capture.py.orig	2026-07-07 17:00:00.000000000 +0200
++++ /usr/lib/python3.14/site-packages/howdy/recorders/video_capture.py	2026-07-07 17:15:00.000000000 +0200
+@@ -6,6 +6,8 @@
+ import cv2
+ import os
+ import sys
++import subprocess
++import time
+ 
+ from i18n import _
+ 
+@@ -45,6 +47,11 @@
+ 		self.fw = None
+ 		# The frame height
+ 		self.fh = None
++
++		# Start the IR bridge directly in the background before opening the device
++		self.bridge_proc = subprocess.Popen(["/usr/local/bin/ir_bridge"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
++		time.sleep(0.4) # Wait for the loopback device to be populated
++
+ 		self._create_reader()
+ 
+ 		# Request a frame to wake the camera up
+@@ -58,6 +65,8 @@
+ 				self.internal.release()
+ 			except AttributeError as err:
+ 				pass
++			if hasattr(self, 'bridge_proc'):
++				self.bridge_proc.terminate()
+ 
+ 	def release(self):
+ 		"""
+@@ -65,6 +74,8 @@
+ 		"""
+ 		if self is not None:
+ 			self.internal.release()
++			if hasattr(self, 'bridge_proc'):
++				self.bridge_proc.terminate()
+ 
+ 	def read_frame(self):
+ 		"""
