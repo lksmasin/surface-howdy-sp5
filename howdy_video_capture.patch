@@ -9,19 +9,24 @@
  
  from i18n import _
  
-@@ -45,6 +47,11 @@
+@@ -45,6 +47,15 @@
  		self.fw = None
  		# The frame height
  		self.fh = None
 +
 +		# Start the IR bridge directly in the background before opening the device
-+		self.bridge_proc = subprocess.Popen(["/usr/local/bin/ir_bridge"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
++		try:
++			with open("/tmp/surface_ir_bridge_dev", "r") as dev_file:
++				dev_in = dev_file.read().strip()
++		except:
++			dev_in = "/dev/video12"
++		self.bridge_proc = subprocess.Popen(["/usr/local/bin/ir_bridge", dev_in], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 +		time.sleep(0.4) # Wait for the loopback device to be populated
 +
  		self._create_reader()
  
  		# Request a frame to wake the camera up
-@@ -58,6 +65,8 @@
+@@ -58,6 +69,8 @@
  				self.internal.release()
  			except AttributeError as err:
  				pass
@@ -30,7 +35,7 @@
  
  	def release(self):
  		"""
-@@ -65,6 +74,8 @@
+@@ -65,6 +78,8 @@
  		"""
  		if self is not None:
  			self.internal.release()
