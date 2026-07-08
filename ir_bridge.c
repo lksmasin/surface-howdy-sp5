@@ -5,6 +5,19 @@
  * unpacks to 8-bit GREY with simultaneous 90° CCW rotation,
  * and writes to a v4l2loopback device for Howdy consumption.
  *
+ * IPU3 ip3y pixel format (V4L2_PIX_FMT_IPU3_Y10):
+ *   25 pixels packed into 32 bytes as a contiguous little-endian
+ *   10-bit bitstream. 6 groups of 4 pixels in 5 bytes (30 bytes),
+ *   plus 1 pixel in 2 bytes (with 6 bits padding).
+ *   Bit layout per 5-byte group:
+ *     Byte 0: Y'0[7:0]
+ *     Byte 1: Y'1[5:0] | Y'0[9:8]
+ *     Byte 2: Y'2[3:0] | Y'1[9:6]
+ *     Byte 3: Y'3[1:0] | Y'2[9:4]
+ *     Byte 4: Y'3[9:2]
+ *   To convert 10-bit to 8-bit: value >> 2
+ *   Reference: kernel Documentation/userspace-api/media/v4l/pixfmt-yuv-luma.rst
+ *
  * Security considerations:
  *   - No shell-out: I2C LED control is done via direct ioctl, not system()
  *   - No setuid(0): privilege manipulation is unnecessary with direct I2C
@@ -22,6 +35,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <linux/videodev2.h>
 #include <linux/i2c-dev.h>
 #include <linux/i2c.h>
@@ -44,60 +58,140 @@
 #define LED_RETRY_DELAY_US 50000   /* 50 ms */
 
 /* ── Pipeline tuning ─────────────────────────────────────────────── */
-#define WARMUP_FRAMES      3       /* discard after LED trigger */
-#define MIN_BRIGHTNESS     3       /* drop only dead-black frames     */
-#define MAX_LIFETIME_SEC   15      /* hard self-timeout */
+#define WARMUP_FRAMES      5       /* discard after LED trigger          */
+#define MIN_BRIGHTNESS     3       /* drop only dead-sensor frames       */
+#define MAX_LIFETIME_SEC   15      /* hard self-timeout                  */
 #define POLL_TIMEOUT_MS    2000
-#define MAX_IDLE_POLLS     3       /* 3 × 2 s = 6 s idle → exit */
+#define MAX_IDLE_POLLS     3       /* 3 × 2 s = 6 s idle → exit         */
 #define NUM_BUFFERS        4
 
 /* ── Runtime state file (written by setup_ipu3.sh at boot) ───────── */
 #define RUNTIME_DEV_FILE   "/run/surface_ir_bridge_dev"
 
+/* ── Debug frame dump ────────────────────────────────────────────── */
+#define DEBUG_DUMP_DIR     "/tmp/ir_bridge_debug"
+#define DEBUG_MAX_FRAMES   5
+
 static volatile sig_atomic_t running = 1;
+static int debug_mode = 0;
 
 static void handle_signal(int sig) {
     (void)sig;
     running = 0;
 }
 
-/* ── IPU3 ip3y unpack + 90° CCW rotation (fused, zero-copy) ─────── */
+/*
+ * ── IPU3 ip3y unpack + 90° CCW rotation ────────────────────────────
+ *
+ * Each scanline is packed as 25 pixels per 32 bytes:
+ *   - 6 × (4 pixels in 5 bytes) = 24 pixels in 30 bytes
+ *   - 1 pixel in 2 bytes (6 bits padding in last byte)
+ *
+ * For a group of 4 pixels in 5 bytes (b0..b4):
+ *   Y'0 = b0 | (b1 & 0x03) << 8   — 10-bit, >> 2 → 8-bit
+ *   Y'1 = (b1 >> 2) | (b2 & 0x0F) << 6
+ *   Y'2 = (b2 >> 4) | (b3 & 0x3F) << 4
+ *   Y'3 = (b3 >> 6) | b4 << 2      — top 8 bits = b4
+ *
+ * Rotation: physical sensor is mounted sideways, so we apply a 90° CCW
+ * rotation during unpack. Input pixel (x, y) maps to output pixel
+ * (y, IN_WIDTH-1-x) in the rotated OUT_WIDTH × OUT_HEIGHT frame.
+ */
 static void unpack_and_rotate_ipu3_line(const uint8_t *in,
                                         uint8_t *out_frame,
                                         int width, int y_in)
 {
-    int out_idx = 0;
-    int in_idx  = 0;
-    while (out_idx < width) {
-        for (int i = 0; i < 6 && out_idx < width; i++) {
-            if (out_idx < width) {
-                out_frame[(IN_WIDTH - 1 - out_idx) * OUT_WIDTH + y_in] =
-                    (in[in_idx + 0] >> 2) | ((in[in_idx + 1] & 0x03) << 6);
-                out_idx++;
-            }
-            if (out_idx < width) {
-                out_frame[(IN_WIDTH - 1 - out_idx) * OUT_WIDTH + y_in] =
-                    (in[in_idx + 1] >> 4) | ((in[in_idx + 2] & 0x0F) << 4);
-                out_idx++;
-            }
-            if (out_idx < width) {
-                out_frame[(IN_WIDTH - 1 - out_idx) * OUT_WIDTH + y_in] =
-                    (in[in_idx + 2] >> 6) | ((in[in_idx + 3] & 0x3F) << 2);
-                out_idx++;
-            }
-            if (out_idx < width) {
-                out_frame[(IN_WIDTH - 1 - out_idx) * OUT_WIDTH + y_in] =
-                    (in[in_idx + 3] >> 8) | ((in[in_idx + 4] & 0xFF) << 0);
-                out_idx++;
-            }
-            in_idx += 5;
+    int x = 0;
+    int byte_idx = 0;
+
+    /* Process 6 groups of 4 pixels (24 pixels, 30 bytes) */
+    for (int group = 0; group < 6 && x < width; group++) {
+        const uint8_t b0 = in[byte_idx + 0];
+        const uint8_t b1 = in[byte_idx + 1];
+        const uint8_t b2 = in[byte_idx + 2];
+        const uint8_t b3 = in[byte_idx + 3];
+        const uint8_t b4 = in[byte_idx + 4];
+
+        /* Y'0: bits [9:0] = b0[7:0] | b1[1:0]<<8.   8-bit = >>2 */
+        if (x < width) {
+            uint8_t val = (b0 >> 2) | ((b1 & 0x03) << 6);
+            out_frame[(IN_WIDTH - 1 - x) * OUT_WIDTH + y_in] = val;
+            x++;
         }
-        if (out_idx < width) {
-            out_frame[(IN_WIDTH - 1 - out_idx) * OUT_WIDTH + y_in] =
-                (in[in_idx + 0] >> 2) | ((in[in_idx + 1] & 0x03) << 6);
-            out_idx++;
+        /* Y'1: bits [9:0] = b1[7:2] | b2[3:0]<<6.   8-bit = >>2 */
+        if (x < width) {
+            uint8_t val = (b1 >> 4) | ((b2 & 0x0F) << 4);
+            out_frame[(IN_WIDTH - 1 - x) * OUT_WIDTH + y_in] = val;
+            x++;
         }
-        in_idx += 2;
+        /* Y'2: bits [9:0] = b2[7:4] | b3[5:0]<<4.   8-bit = >>2 */
+        if (x < width) {
+            uint8_t val = (b2 >> 6) | ((b3 & 0x3F) << 2);
+            out_frame[(IN_WIDTH - 1 - x) * OUT_WIDTH + y_in] = val;
+            x++;
+        }
+        /* Y'3: bits [9:0] = b3[7:6] | b4[7:0]<<2.   8-bit = b4 */
+        if (x < width) {
+            out_frame[(IN_WIDTH - 1 - x) * OUT_WIDTH + y_in] = b4;
+            x++;
+        }
+        byte_idx += 5;
+    }
+
+    /* 25th pixel in the 32-byte block (same formula as Y'0) */
+    if (x < width) {
+        uint8_t val = (in[byte_idx] >> 2) | ((in[byte_idx + 1] & 0x03) << 6);
+        out_frame[(IN_WIDTH - 1 - x) * OUT_WIDTH + y_in] = val;
+        x++;
+    }
+    /* byte_idx += 2; → advances to byte 32, start of next block */
+
+    /* If width > 25, continue with subsequent 32-byte blocks.
+     * For 640px width: 640 / 25 = 25.6 → 26 blocks × 32 = 832 bytes/line
+     * which matches IN_BYTES_PER_LINE. */
+    byte_idx += 2;
+
+    while (x < width) {
+        /* Full groups of 4 within this block */
+        int remaining = width - x;
+        int groups = (remaining >= 24) ? 6 : (remaining / 4);
+
+        for (int group = 0; group < groups; group++) {
+            const uint8_t b0 = in[byte_idx + 0];
+            const uint8_t b1 = in[byte_idx + 1];
+            const uint8_t b2 = in[byte_idx + 2];
+            const uint8_t b3 = in[byte_idx + 3];
+            const uint8_t b4 = in[byte_idx + 4];
+
+            if (x < width) {
+                out_frame[(IN_WIDTH - 1 - x) * OUT_WIDTH + y_in] =
+                    (b0 >> 2) | ((b1 & 0x03) << 6);
+                x++;
+            }
+            if (x < width) {
+                out_frame[(IN_WIDTH - 1 - x) * OUT_WIDTH + y_in] =
+                    (b1 >> 4) | ((b2 & 0x0F) << 4);
+                x++;
+            }
+            if (x < width) {
+                out_frame[(IN_WIDTH - 1 - x) * OUT_WIDTH + y_in] =
+                    (b2 >> 6) | ((b3 & 0x3F) << 2);
+                x++;
+            }
+            if (x < width) {
+                out_frame[(IN_WIDTH - 1 - x) * OUT_WIDTH + y_in] = b4;
+                x++;
+            }
+            byte_idx += 5;
+        }
+
+        /* 25th pixel */
+        if (x < width) {
+            out_frame[(IN_WIDTH - 1 - x) * OUT_WIDTH + y_in] =
+                (in[byte_idx] >> 2) | ((in[byte_idx + 1] & 0x03) << 6);
+            x++;
+        }
+        byte_idx += 2;
     }
 }
 
@@ -147,6 +241,22 @@ static int compute_mean_brightness(const uint8_t *frame, int size)
     return count > 0 ? (int)(sum / count) : 0;
 }
 
+/* ── Debug frame dump ────────────────────────────────────────────── */
+static void dump_debug_frame(const uint8_t *frame, int size, int frame_num,
+                             int brightness)
+{
+    char path[128];
+    snprintf(path, sizeof(path), "%s/frame_%04d_b%03d.raw",
+             DEBUG_DUMP_DIR, frame_num, brightness);
+
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd >= 0) {
+        write(fd, frame, size);
+        close(fd);
+        fprintf(stderr, "ir_bridge: debug dump → %s\n", path);
+    }
+}
+
 /* ── Validate device path ────────────────────────────────────────── */
 static int validate_video_device(const char *path)
 {
@@ -190,9 +300,11 @@ static int validate_video_device(const char *path)
 /* ── Resolve which /dev/videoN to use ────────────────────────────── */
 static const char *resolve_device_path(int argc, char **argv)
 {
-    /* Priority 1: explicit command-line argument */
-    if (argc > 1)
-        return argv[1];
+    /* Priority 1: explicit command-line argument (skip flags) */
+    for (int i = 1; i < argc; i++) {
+        if (argv[i][0] != '-')
+            return argv[i];
+    }
 
     /* Priority 2: runtime state file written by setup_ipu3.sh */
     static char path_buf[64];
@@ -215,6 +327,20 @@ int main(int argc, char **argv)
 {
     signal(SIGTERM, handle_signal);
     signal(SIGINT,  handle_signal);
+
+    /* Check for -d / --debug flag */
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--debug") == 0) {
+            debug_mode = 1;
+            fprintf(stderr, "ir_bridge: debug mode enabled, "
+                    "dumping frames to %s\n", DEBUG_DUMP_DIR);
+        }
+    }
+
+    if (debug_mode) {
+        /* Create debug dump directory */
+        mkdir(DEBUG_DUMP_DIR, 0755);
+    }
 
     struct timespec t0;
     clock_gettime(CLOCK_MONOTONIC, &t0);
@@ -309,10 +435,13 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    int led_ok          = 0;   /* 1 once LED is confirmed on           */
-    int frames_after_led = 0;  /* frames dequeued since LED trigger     */
+    int led_ok           = 0;   /* 1 once LED is confirmed on          */
+    int frames_after_led = 0;   /* frames dequeued since LED trigger   */
     int total_frames     = 0;
-    int idle_polls       = 0;  /* consecutive poll timeouts             */
+    int written_frames   = 0;   /* frames actually sent to loopback    */
+    int dropped_dark     = 0;   /* frames dropped for being too dark   */
+    int idle_polls       = 0;   /* consecutive poll timeouts            */
+    int debug_dumped     = 0;   /* frames dumped in debug mode          */
 
     fprintf(stderr, "ir_bridge: started pid=%d dev=%s\n", getpid(), dev_in);
 
@@ -368,15 +497,15 @@ int main(int argc, char **argv)
          * complete and the I2C bus is free.
          */
         if (!led_ok && total_frames == 1) {
-            for (int try = 0; try < LED_MAX_RETRIES; try++) {
+            for (int attempt = 0; attempt < LED_MAX_RETRIES; attempt++) {
                 if (trigger_ir_led() == 0) {
                     led_ok = 1;
                     fprintf(stderr, "ir_bridge: LED on (attempt %d)\n",
-                            try + 1);
+                            attempt + 1);
                     break;
                 }
                 fprintf(stderr, "ir_bridge: LED attempt %d/%d failed\n",
-                        try + 1, LED_MAX_RETRIES);
+                        attempt + 1, LED_MAX_RETRIES);
                 usleep(LED_RETRY_DELAY_US);
             }
             if (!led_ok) {
@@ -389,7 +518,7 @@ int main(int argc, char **argv)
 
         if (led_ok) frames_after_led++;
 
-        /* Skip warmup frames so Howdy only gets post-LED-on frames */
+        /* Skip warmup frames so sensor/LED can stabilize */
         if (!led_ok || frames_after_led <= WARMUP_FRAMES) {
             ioctl(fd_in, VIDIOC_QBUF, &buf);
             continue;
@@ -401,11 +530,29 @@ int main(int argc, char **argv)
             unpack_and_rotate_ipu3_line(in_data + y * IN_BYTES_PER_LINE,
                                         out_frame, IN_WIDTH, y);
 
-        /* Brightness gate — drop dark frames instead of confusing Howdy */
+        /* Brightness gate — filter out LED-off strobe frames.
+         *
+         * The OV7251 in strobe mode alternates LED on/off every frame.
+         * LED-on frames have mean brightness ~25, LED-off frames ~5.
+         * We only pass through LED-on (bright) frames to Howdy, which
+         * eliminates the alternating-darkness pattern that confuses
+         * face detection. */
         int bright = compute_mean_brightness(out_frame, OUT_WIDTH * OUT_HEIGHT);
+
+        /* Debug: dump first N frames regardless of brightness */
+        if (debug_mode && debug_dumped < DEBUG_MAX_FRAMES) {
+            dump_debug_frame(out_frame, OUT_WIDTH * OUT_HEIGHT,
+                             total_frames, bright);
+            debug_dumped++;
+        }
+
         if (bright < MIN_BRIGHTNESS) {
-            fprintf(stderr, "ir_bridge: dark frame dropped "
-                    "(brightness=%d < %d)\n", bright, MIN_BRIGHTNESS);
+            dropped_dark++;
+            if (dropped_dark <= 3 || dropped_dark % 50 == 0) {
+                fprintf(stderr, "ir_bridge: dark frame dropped "
+                        "(brightness=%d < %d, total_dropped=%d)\n",
+                        bright, MIN_BRIGHTNESS, dropped_dark);
+            }
             ioctl(fd_in, VIDIOC_QBUF, &buf);
             continue;
         }
@@ -414,6 +561,8 @@ int main(int argc, char **argv)
         ssize_t wr = write(fd_out, out_frame, OUT_WIDTH * OUT_HEIGHT);
         if (wr < 0)
             perror("ir_bridge: write loopback");
+        else
+            written_frames++;
 
         if (ioctl(fd_in, VIDIOC_QBUF, &buf) < 0) {
             perror("ir_bridge: QBUF loop");
@@ -430,6 +579,7 @@ int main(int argc, char **argv)
     close(fd_in);
     close(fd_out);
 
-    fprintf(stderr, "ir_bridge: exit (%d frames processed)\n", total_frames);
+    fprintf(stderr, "ir_bridge: exit (total=%d written=%d dropped_dark=%d)\n",
+            total_frames, written_frames, dropped_dark);
     return 0;
 }
