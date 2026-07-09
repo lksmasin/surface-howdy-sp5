@@ -28,6 +28,21 @@ for dev in /dev/media*; do
         echo "$VIDEO_NODE" > "$RUNTIME_FILE"
         chmod 0644 "$RUNTIME_FILE"
 
+        # Increase sensor exposure and gain for much brighter images
+        # The OV7251 is extremely dark by default
+        OV_SUBDEV=""
+        for sub in /sys/class/video4linux/v4l-subdev*; do
+            if grep -q "ov7251" "$sub/name" 2>/dev/null; then
+                OV_SUBDEV="/dev/$(basename "$sub")"
+                break
+            fi
+        done
+        if [ -n "$OV_SUBDEV" ]; then
+            v4l2-ctl -d "$OV_SUBDEV" --set-ctrl exposure=1000 2>/dev/null || true
+            v4l2-ctl -d "$OV_SUBDEV" --set-ctrl analogue_gain=32 2>/dev/null || true
+            echo "setup_ipu3: boosted exposure on $OV_SUBDEV"
+        fi
+
         echo "setup_ipu3: sensor on $dev, capture node $VIDEO_NODE"
         exit 0
     fi
