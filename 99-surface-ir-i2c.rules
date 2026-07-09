@@ -1,0 +1,1 @@
+SUBSYSTEM=="i2c-dev", KERNEL=="i2c-3", GROUP="video", MODE="0660"

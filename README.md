@@ -42,11 +42,22 @@ You also need standard build tools and v4l2loopback:
 sudo dnf install gcc v4l2loopback
 ```
 
-### 2. Configure v4l2loopback and Media Paths (Systemd Oneshot)
+### 2. Configure Hardware Permissions and Media Paths
 Because the Linux kernel randomly enumerates `/dev/media*` devices on boot, hardcoded media paths will fail after a restart. We provide a dynamic setup script that auto-detects the IPU3 sensor.
 
-Copy the setup script and the systemd service to initialize the hardware on boot:
+Furthermore, desktop environments like KDE Plasma run their lock screens as an **unprivileged user**. By default, `/dev/i2c-3` is restricted to `root`, meaning the lock screen cannot turn on the IR LED and face detection will fail. We provide a `udev` rule to grant the `video` group access to the I2C bus.
+
+Ensure your user is in the `video` group:
 ```bash
+sudo usermod -aG video $USER
+```
+
+Copy the udev rule, setup script, and the systemd service to initialize the hardware on boot:
+```bash
+sudo cp 99-surface-ir-i2c.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules
+sudo udevadm trigger -c add -s i2c-dev
+
 sudo cp setup_ipu3.sh /usr/local/bin/setup_ipu3.sh
 sudo chmod +x /usr/local/bin/setup_ipu3.sh
 
